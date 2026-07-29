@@ -10,7 +10,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://data.deeplumen.io').replace(/\/+$/, '');
 const CATALOG_ID = 'cat_product_eval_100k_v01';
 const PROVIDER_ID = 'deeplumen_product_eval';
-const SERVICE_VERSION = 'product-eval-catalog-api.v0.3.0';
+const SERVICE_VERSION = 'product-eval-catalog-api.v0.3.1';
 const DATASET_PROFILE = 'source_products_synthetic_variants';
 const EXPECTED_DB_USER = process.env.EXPECTED_DB_USER || 'eval_reader';
 const DB_SSL_MODE = process.env.DB_SSL_MODE || 'require';
@@ -117,6 +117,27 @@ const API_FILTERS = new Set([
   'minPrice',
   'maxPrice',
 ]);
+const AGENT_HIDDEN_RESPONSE_FIELDS = new Set([
+  'commercialFactProvenance',
+  'partialProductReadyGate',
+  'sourceFile',
+  'sourceLine',
+  'impossibleCombination',
+]);
+
+function redactAgentHiddenResponseFields(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactAgentHiddenResponseFields(item));
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => !AGENT_HIDDEN_RESPONSE_FIELDS.has(key))
+        .map(([key, item]) => [key, redactAgentHiddenResponseFields(item)]),
+    );
+  }
+  return value;
+}
 
 function sendJson(res, status, payload, extraHeaders = {}) {
   res.writeHead(status, {
@@ -124,7 +145,7 @@ function sendJson(res, status, payload, extraHeaders = {}) {
     'cache-control': 'no-store',
     ...extraHeaders,
   });
-  res.end(JSON.stringify(payload));
+  res.end(JSON.stringify(redactAgentHiddenResponseFields(payload)));
 }
 
 function sendText(res, status, body, contentType = 'text/plain; charset=utf-8') {
@@ -1018,8 +1039,8 @@ function manifestObjectContracts() {
     },
     {
       required_fields: [
-        'variant#/factOrigin', 'variant#/commercialFactProvenance', 'variant#/variantId',
-        'variant#/productId', 'variant#/sku', 'variant#/variantTitleZh', 'variant#/variantTitleEn',
+        'variant#/factOrigin', 'variant#/variantId', 'variant#/productId',
+        'variant#/sku', 'variant#/variantTitleZh', 'variant#/variantTitleEn',
         'variant#/optionValues', 'variant#/variantAttributes', 'variant#/isActive',
         'variant#/classificationStatus', 'variant#/schemaVersion', 'variant#/catalogVersion',
         'variant#/snapshotId',
@@ -1034,8 +1055,8 @@ function manifestObjectContracts() {
     },
     {
       required_fields: [
-        'offer#/factOrigin', 'offer#/commercialFactProvenance', 'offer#/offerId', 'offer#/variantId',
-        'offer#/price', 'offer#/currency', 'offer#/listPrice', 'offer#/inventoryStatus',
+        'offer#/factOrigin', 'offer#/offerId', 'offer#/variantId', 'offer#/price',
+        'offer#/currency', 'offer#/listPrice', 'offer#/inventoryStatus',
         'offer#/inventoryQuantity', 'offer#/isSaleable', 'offer#/snapshotTime', 'offer#/snapshotId',
       ],
       additional_fields_policy: 'reject',
@@ -1315,13 +1336,14 @@ async function mcp(body) {
       else if (params.name === 'getProductDetail') result = await resolveProduct(args.productId || args.entryId);
       else if (params.name === 'listProductVariants') result = await listProductVariants(args.productId);
       else throw new HttpError(400, 'unknown_tool', `Unknown MCP tool ${params.name}`);
+      const visibleResult = redactAgentHiddenResponseFields(result);
       return {
         jsonrpc: '2.0',
         id,
         result: {
-          ...releaseIdentity(result),
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-          structuredContent: result,
+          ...releaseIdentity(visibleResult),
+          content: [{ type: 'text', text: JSON.stringify(visibleResult, null, 2) }],
+          structuredContent: visibleResult,
           isError: false,
         },
       };
@@ -1405,9 +1427,9 @@ curl -sS ${PUBLIC_BASE_URL}/api/search \\
   }'
 \`\`\`
 
-All attribute filters are evaluated against the same Variant row. An impossible
-combination such as black + size 42 returns zero when that exact Variant does not
-exist; values from different Variants are never combined.
+All attribute filters are evaluated against the same Variant row. A filter
+combination returns zero when no single Variant contains all requested option
+values; values from different Variants are never combined.
 
 ## MCP endpoint
 
@@ -1510,6 +1532,7 @@ export {
   parseCursor,
   requestFingerprint,
   releaseIdentity,
+  redactAgentHiddenResponseFields,
   summarizeHit,
   usageMarkdown,
   validateAttributeFilters,
