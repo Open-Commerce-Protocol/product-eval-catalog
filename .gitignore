@@ -1,0 +1,12 @@
+node_modules/
+.env
+*.env
+*.key
+*signing-key*
+secrets/
+*.dump
+*.jsonl
+runs/
+inputs/
+backups/
+.DS_Store
