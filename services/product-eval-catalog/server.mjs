@@ -10,7 +10,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://data.deeplumen.io').replace(/\/+$/, '');
 const CATALOG_ID = 'cat_product_eval_100k_v01';
 const PROVIDER_ID = 'deeplumen_product_eval';
-const SERVICE_VERSION = 'product-eval-catalog-api.v0.3.1';
+const SERVICE_VERSION = 'product-eval-catalog-api.v0.3.2';
 const DATASET_PROFILE = 'source_products_synthetic_variants';
 const EXPECTED_DB_USER = process.env.EXPECTED_DB_USER || 'eval_reader';
 const DB_SSL_MODE = process.env.DB_SSL_MODE || 'require';
@@ -117,12 +117,63 @@ const API_FILTERS = new Set([
   'minPrice',
   'maxPrice',
 ]);
+const PUBLIC_PRODUCT_FIELDS = Object.freeze([
+  'productId',
+  'categoryCode',
+  'categoryNameZh',
+  'categoryNameEn',
+  'productTypeCode',
+  'productTypeNameZh',
+  'productTypeNameEn',
+  'titleZh',
+  'titleEn',
+  'brandCode',
+  'brandName',
+  'descriptionZh',
+  'descriptionEn',
+  'sellingPointsZh',
+  'sellingPointsEn',
+  'usageTags',
+  'searchAliasesZh',
+  'searchAliasesEn',
+  'attributes',
+]);
+const PUBLIC_VARIANT_FIELDS = Object.freeze([
+  'variantId',
+  'productId',
+  'sku',
+  'variantTitleZh',
+  'variantTitleEn',
+  'optionValues',
+  'variantAttributes',
+  'isActive',
+]);
+const PUBLIC_OFFER_FIELDS = Object.freeze([
+  'offerId',
+  'variantId',
+  'price',
+  'currency',
+  'listPrice',
+  'inventoryStatus',
+  'inventoryQuantity',
+  'isSaleable',
+  'snapshotTime',
+]);
+const PUBLIC_VERSION_FIELDS = Object.freeze([
+  'schemaVersion',
+  'catalogVersion',
+  'indexVersion',
+  'apiVersion',
+  'snapshotId',
+]);
 const AGENT_HIDDEN_RESPONSE_FIELDS = new Set([
   'commercialFactProvenance',
   'partialProductReadyGate',
   'sourceFile',
   'sourceLine',
   'impossibleCombination',
+  'contentQuality',
+  'factOrigin',
 ]);
 
 function redactAgentHiddenResponseFields(value) {
@@ -151,6 +202,41 @@ function sendJson(res, status, payload, extraHeaders = {}) {
 function sendText(res, status, body, contentType = 'text/plain; charset=utf-8') {
   res.writeHead(status, { 'content-type': contentType, 'cache-control': 'no-store' });
   res.end(body);
+}
+
+function projectPublicFields(source, fields, label) {
+  assertObject(source, label);
+  const projected = {};
+  for (const field of fields) {
+    const value = source[field];
+    if (value === undefined || value === null) {
+      throw new HttpError(503, 'public_projection_invalid', `${label}.${field} is missing from the active release`);
+    }
+    projected[field] = value;
+  }
+  return projected;
+}
+
+function projectProduct(product) {
+  return projectPublicFields(product, PUBLIC_PRODUCT_FIELDS, 'product');
+}
+
+function projectVariant(variant) {
+  return projectPublicFields(variant, PUBLIC_VARIANT_FIELDS, 'variant');
+}
+
+function projectOffer(offer) {
+  return projectPublicFields(offer, PUBLIC_OFFER_FIELDS, 'offer');
+}
+
+function projectVersion(version) {
+  return projectPublicFields(version, PUBLIC_VERSION_FIELDS, 'version');
+}
+
+function projectVariantWithOffer(variant) {
+  const publicVariant = projectVariant(variant);
+  publicVariant.offer = projectOffer(variant.offer);
+  return publicVariant;
 }
 
 function assertObject(value, label) {
@@ -261,20 +347,17 @@ function parseCursor(value, release, fingerprint, sortBy, signingKey = CURSOR_SI
   if (parsed.v !== 3) {
     throw new HttpError(409, 'cursor_release_mismatch', 'cursor belongs to a prior or unsupported catalog release; restart pagination from the first page', {
       activeSnapshotId: release.snapshotId,
-      activeReleaseRootSha256: release.releaseRootSha256,
     });
   }
-  const allowed = new Set(['v', 'snapshotId', 'releaseRootSha256', 'requestFingerprint', 'sortBy', 'lastId', 'lastScore', 'lastPrice']);
+  const allowed = new Set(['v', 'snapshotId', 'requestFingerprint', 'sortBy', 'lastId', 'lastScore', 'lastPrice']);
   const unknown = Object.keys(parsed).filter((key) => !allowed.has(key));
   if (unknown.length > 0 || !SORT_VALUES.has(parsed.sortBy)) {
     throw new HttpError(400, 'invalid_cursor', 'cursor payload has an unsupported contract');
   }
-  if (parsed.snapshotId !== release.snapshotId || parsed.releaseRootSha256 !== release.releaseRootSha256) {
+  if (parsed.snapshotId !== release.snapshotId) {
     throw new HttpError(409, 'cursor_release_mismatch', 'cursor release identity does not match the active catalog release; restart pagination from the first page', {
       cursorSnapshotId: parsed.snapshotId,
       activeSnapshotId: release.snapshotId,
-      cursorReleaseRootSha256: parsed.releaseRootSha256,
-      activeReleaseRootSha256: release.releaseRootSha256,
     });
   }
   if (parsed.requestFingerprint !== fingerprint || parsed.sortBy !== sortBy) {
@@ -298,7 +381,6 @@ function encodeCursor(row, sortBy, release, fingerprint, signingKey = CURSOR_SIG
     ? {
         v: 3,
         snapshotId: release.snapshotId,
-        releaseRootSha256: release.releaseRootSha256,
         requestFingerprint: fingerprint,
         sortBy,
         lastId: row.search_document_id,
@@ -307,7 +389,6 @@ function encodeCursor(row, sortBy, release, fingerprint, signingKey = CURSOR_SIG
     : {
         v: 3,
         snapshotId: release.snapshotId,
-        releaseRootSha256: release.releaseRootSha256,
         requestFingerprint: fingerprint,
         sortBy,
         lastId: row.search_document_id,
@@ -596,7 +677,6 @@ function buildSearchSql({ query, filters, attributeFilters, cursor, limit, sortB
       (${relevanceSql})::integer as relevance_score,
       o.price as sort_price,
       jsonb_build_object(
-        'factOrigin', 'source',
         'productId', p."productId", 'categoryCode', p."categoryCode", 'categoryNameZh', p."categoryNameZh",
         'categoryNameEn', p."categoryNameEn", 'productTypeCode', p."productTypeCode",
         'productTypeNameZh', p."productTypeNameZh", 'productTypeNameEn', p."productTypeNameEn",
@@ -604,19 +684,15 @@ function buildSearchSql({ query, filters, attributeFilters, cursor, limit, sortB
         'descriptionZh', p."descriptionZh", 'descriptionEn', p."descriptionEn",
         'sellingPointsZh', p."sellingPointsZh", 'sellingPointsEn', p."sellingPointsEn",
         'usageTags', p."usageTags", 'searchAliasesZh', p."searchAliasesZh", 'searchAliasesEn', p."searchAliasesEn",
-        'attributes', p.attributes, 'contentQuality', p."contentQuality",
-        'productGroupId', p."productGroupId", 'semanticDuplicateGroupSize', p."semanticDuplicateGroupSize",
-        'isCanonicalProduct', p."isCanonicalProduct"
+        'attributes', p.attributes
       ) as product,
       jsonb_build_object(
-        'factOrigin', v.fact_origin, 'commercialFactProvenance', v.commercial_fact_provenance,
         'variantId', v."variantId", 'productId', v."productId", 'sku', v.sku,
         'variantTitleZh', v."variantTitleZh", 'variantTitleEn', v."variantTitleEn",
         'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes",
-        'isActive', v."isActive", 'classificationStatus', v."classificationStatus"
+        'isActive', v."isActive"
       ) as variant,
       jsonb_build_object(
-        'factOrigin', o.fact_origin, 'commercialFactProvenance', o.commercial_fact_provenance,
         'offerId', o."offerId", 'variantId', o."variantId", 'price', o.price, 'currency', o.currency,
         'listPrice', o."listPrice", 'inventoryStatus', o."inventoryStatus",
         'inventoryQuantity', o."inventoryQuantity", 'isSaleable', o."isSaleable", 'snapshotTime', o."snapshotTime"
@@ -715,21 +791,22 @@ function summarizeHit(row, query, filters, attributeFilters) {
 }
 
 function toEntry(row, query, filters, attributeFilters, release) {
+  const product = projectProduct(row.product);
   return {
     kind: 'CatalogEntry',
     catalog_id: CATALOG_ID,
-    entry_id: row.product.productId,
+    entry_id: product.productId,
     provider_id: PROVIDER_ID,
-    object_id: row.product.productId,
+    object_id: product.productId,
     object_type: 'ocp.commerce.product',
-    commercial_object_id: row.product.productId,
-    title: row.product.titleZh || row.product.titleEn,
-    summary: row.product.descriptionZh || row.product.descriptionEn,
+    commercial_object_id: product.productId,
+    title: product.titleZh || product.titleEn,
+    summary: product.descriptionZh || product.descriptionEn,
     attributes: {
-      product: row.product,
-      variant: row.variant,
-      offer: row.offer,
-      version: release,
+      product,
+      variant: projectVariant(row.variant),
+      offer: projectOffer(row.offer),
+      version: projectVersion(release),
       hit: summarizeHit(row, query, filters, attributeFilters),
     },
   };
@@ -775,7 +852,6 @@ async function fetchProductRow(productId) {
     select
       sd.search_document_id,
       jsonb_build_object(
-        'factOrigin', 'source',
         'productId', p."productId", 'categoryCode', p."categoryCode", 'categoryNameZh', p."categoryNameZh",
         'categoryNameEn', p."categoryNameEn", 'productTypeCode', p."productTypeCode",
         'productTypeNameZh', p."productTypeNameZh", 'productTypeNameEn', p."productTypeNameEn",
@@ -783,19 +859,15 @@ async function fetchProductRow(productId) {
         'descriptionZh', p."descriptionZh", 'descriptionEn', p."descriptionEn",
         'sellingPointsZh', p."sellingPointsZh", 'sellingPointsEn', p."sellingPointsEn",
         'usageTags', p."usageTags", 'searchAliasesZh', p."searchAliasesZh", 'searchAliasesEn', p."searchAliasesEn",
-        'attributes', p.attributes, 'contentQuality', p."contentQuality",
-        'productGroupId', p."productGroupId", 'semanticDuplicateGroupSize', p."semanticDuplicateGroupSize",
-        'isCanonicalProduct', p."isCanonicalProduct"
+        'attributes', p.attributes
       ) as product,
       jsonb_build_object(
-        'factOrigin', v.fact_origin, 'commercialFactProvenance', v.commercial_fact_provenance,
         'variantId', v."variantId", 'productId', v."productId", 'sku', v.sku,
         'variantTitleZh', v."variantTitleZh", 'variantTitleEn', v."variantTitleEn",
         'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes",
-        'isActive', v."isActive", 'classificationStatus', v."classificationStatus"
+        'isActive', v."isActive"
       ) as variant,
       jsonb_build_object(
-        'factOrigin', o.fact_origin, 'commercialFactProvenance', o.commercial_fact_provenance,
         'offerId', o."offerId", 'variantId', o."variantId", 'price', o.price, 'currency', o.currency,
         'listPrice', o."listPrice", 'inventoryStatus', o."inventoryStatus",
         'inventoryQuantity', o."inventoryQuantity", 'isSaleable', o."isSaleable", 'snapshotTime', o."snapshotTime"
@@ -841,19 +913,25 @@ async function resolveProduct(entryId) {
   }
   const resolvedAt = new Date().toISOString();
   const objectUpdatedAt = row.offer.snapshotTime ? new Date(row.offer.snapshotTime).toISOString() : resolvedAt;
+  const product = projectProduct(row.product);
   return {
     ocp_version: '1.0',
     kind: 'ResolvableReference',
     id: `res_${crypto.randomUUID()}`,
     catalog_id: CATALOG_ID,
     ...releaseIdentity(release),
-    entry_id: row.product.productId,
-    commercial_object_id: row.product.productId,
-    object_id: row.product.productId,
+    entry_id: product.productId,
+    commercial_object_id: product.productId,
+    object_id: product.productId,
     object_type: 'ocp.commerce.product',
     provider_id: PROVIDER_ID,
-    title: row.product.titleZh || row.product.titleEn,
-    visible_attributes: { product: row.product, variant: row.variant, offer: row.offer, version: releaseIdentity(release) },
+    title: product.titleZh || product.titleEn,
+    visible_attributes: {
+      product,
+      variant: projectVariant(row.variant),
+      offer: projectOffer(row.offer),
+      version: projectVersion(releaseIdentity(release)),
+    },
     action_bindings: [],
     freshness: {
       object_updated_at: objectUpdatedAt,
@@ -879,19 +957,28 @@ async function resolveProduct(entryId) {
   };
 }
 
+async function apiResolveProduct(entryId) {
+  const resolved = await resolveProduct(entryId);
+  return {
+    product: resolved.visible_attributes.product,
+    variant: resolved.visible_attributes.variant,
+    offer: resolved.visible_attributes.offer,
+    version: resolved.visible_attributes.version,
+  };
+}
+
 async function listProductVariants(productId) {
   const release = await activeRelease();
   const result = await pool.query(`
     select jsonb_build_object(
-      'factOrigin', v.fact_origin, 'commercialFactProvenance', v.commercial_fact_provenance,
       'variantId', v."variantId", 'productId', v."productId", 'sku', v.sku,
       'variantTitleZh', v."variantTitleZh", 'variantTitleEn', v."variantTitleEn",
       'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes",
       'isActive', v."isActive", 'classificationStatus', v."classificationStatus",
       'schemaVersion', v."schemaVersion", 'catalogVersion', v."catalogVersion", 'snapshotId', v.snapshot_id,
       'offer', jsonb_build_object(
-        'factOrigin', o.fact_origin, 'commercialFactProvenance', o.commercial_fact_provenance,
-        'offerId', o."offerId", 'price', o.price, 'currency', o.currency,
+        'offerId', o."offerId", 'variantId', o."variantId", 'price', o.price, 'currency', o.currency,
+        'listPrice', o."listPrice",
         'inventoryStatus', o."inventoryStatus", 'inventoryQuantity', o."inventoryQuantity",
         'isSaleable', o."isSaleable", 'snapshotTime', o."snapshotTime"
       )
@@ -913,7 +1000,7 @@ async function listProductVariants(productId) {
       });
     }
   }
-  return { productId, ...releaseIdentity(release), variants: result.rows.map((row) => row.variant) };
+  return { productId, version: projectVersion(releaseIdentity(release)), variants: result.rows.map((row) => projectVariantWithOffer(row.variant)) };
 }
 
 async function readiness() {
@@ -1000,8 +1087,6 @@ function releaseIdentity(release) {
     indexVersion: release.indexVersion,
     apiVersion: release.apiVersion,
     snapshotId: release.snapshotId,
-    datasetProfile: release.datasetProfile,
-    releaseRootSha256: release.releaseRootSha256,
   };
 }
 
@@ -1026,8 +1111,7 @@ function manifestObjectContracts() {
         'product#/titleZh', 'product#/titleEn', 'product#/brandCode', 'product#/brandName',
         'product#/descriptionZh', 'product#/descriptionEn', 'product#/sellingPointsZh',
         'product#/sellingPointsEn', 'product#/usageTags', 'product#/searchAliasesZh',
-        'product#/searchAliasesEn', 'product#/attributes', 'product#/schemaVersion',
-        'product#/catalogVersion', 'product#/indexVersion', 'product#/apiVersion', 'product#/snapshotId',
+        'product#/searchAliasesEn', 'product#/attributes',
       ],
       additional_fields_policy: 'reject',
       identity_policy: {
@@ -1039,11 +1123,9 @@ function manifestObjectContracts() {
     },
     {
       required_fields: [
-        'variant#/factOrigin', 'variant#/variantId', 'variant#/productId',
-        'variant#/sku', 'variant#/variantTitleZh', 'variant#/variantTitleEn',
-        'variant#/optionValues', 'variant#/variantAttributes', 'variant#/isActive',
-        'variant#/classificationStatus', 'variant#/schemaVersion', 'variant#/catalogVersion',
-        'variant#/snapshotId',
+        'variant#/variantId', 'variant#/productId', 'variant#/sku',
+        'variant#/variantTitleZh', 'variant#/variantTitleEn', 'variant#/optionValues',
+        'variant#/variantAttributes', 'variant#/isActive',
       ],
       additional_fields_policy: 'reject',
       identity_policy: {
@@ -1055,9 +1137,9 @@ function manifestObjectContracts() {
     },
     {
       required_fields: [
-        'offer#/factOrigin', 'offer#/offerId', 'offer#/variantId', 'offer#/price',
-        'offer#/currency', 'offer#/listPrice', 'offer#/inventoryStatus',
-        'offer#/inventoryQuantity', 'offer#/isSaleable', 'offer#/snapshotTime', 'offer#/snapshotId',
+        'offer#/offerId', 'offer#/variantId', 'offer#/price', 'offer#/currency',
+        'offer#/listPrice', 'offer#/inventoryStatus', 'offer#/inventoryQuantity',
+        'offer#/isSaleable', 'offer#/snapshotTime',
       ],
       additional_fields_policy: 'reject',
       identity_policy: {
@@ -1121,7 +1203,6 @@ function buildManifest(release) {
       supports_resolve: true,
       metadata: {
         release_identity: releaseIdentity(release),
-        dataset_profile: release.datasetProfile,
         input_constraints: {
           query_max_length: 500,
           cursor_max_bytes: 512,
@@ -1210,18 +1291,9 @@ async function ocpQuery(body) {
 async function apiSearch(body) {
   const result = await searchProducts(body, 'api');
   return {
-    kind: 'ProductSearchResult',
-    serviceVersion: SERVICE_VERSION,
-    catalogId: CATALOG_ID,
-    ...releaseIdentity(result.release),
-    query: result.query,
-    filters: result.filters,
-    attributeFilters: result.attributeFilters,
-    sortBy: result.sortBy,
-    resultCount: result.items.length,
+    version: projectVersion(releaseIdentity(result.release)),
     page: { limit: result.limit, hasMore: result.hasMore, nextCursor: result.nextCursor },
     items: result.items.map((item) => item.entry.attributes),
-    ocpEntries: result.items,
   };
 }
 
@@ -1333,7 +1405,7 @@ async function mcp(body) {
       const args = params.arguments;
       let result;
       if (params.name === 'searchProducts') result = await apiSearch(args);
-      else if (params.name === 'getProductDetail') result = await resolveProduct(args.productId || args.entryId);
+      else if (params.name === 'getProductDetail') result = await apiResolveProduct(args.productId || args.entryId);
       else if (params.name === 'listProductVariants') result = await listProductVariants(args.productId);
       else throw new HttpError(400, 'unknown_tool', `Unknown MCP tool ${params.name}`);
       const visibleResult = redactAgentHiddenResponseFields(result);
@@ -1341,7 +1413,6 @@ async function mcp(body) {
         jsonrpc: '2.0',
         id,
         result: {
-          ...releaseIdentity(visibleResult),
           content: [{ type: 'text', text: JSON.stringify(visibleResult, null, 2) }],
           structuredContent: visibleResult,
           isError: false,
@@ -1485,7 +1556,7 @@ async function route(req, res) {
   if (req.method === 'POST' && url.pathname === '/api/search') return sendJson(res, 200, await apiSearch(await readJson(req)), cors);
   if (req.method === 'POST' && url.pathname === '/api/resolve') {
     const body = await readJson(req);
-    return sendJson(res, 200, await resolveProduct(body.productId || body.entryId || body.entry_id), cors);
+    return sendJson(res, 200, await apiResolveProduct(body.productId || body.entryId || body.entry_id), cors);
   }
   if (req.method === 'POST' && url.pathname === '/api/variants') {
     const body = await readJson(req);
