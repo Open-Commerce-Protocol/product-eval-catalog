@@ -6,7 +6,10 @@
   "description": "Read-only OCP/API/MCP query layer for the product discovery eval catalog",
   "main": "server.mjs",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check validation.test.mjs && node --check readiness.test.mjs && node --check integration.test.mjs",
+    "test": "npm run check && node validation.test.mjs && node --test readiness.test.mjs integration.test.mjs",
+    "test:integration": "node --test integration.test.mjs"
   },
   "dependencies": {
     "pg": "^8.13.1"

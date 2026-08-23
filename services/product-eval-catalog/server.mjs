@@ -10,7 +10,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://data.deeplumen.io').replace(/\/+$/, '');
 const CATALOG_ID = 'cat_product_eval_100k_v01';
 const PROVIDER_ID = 'deeplumen_product_eval';
-const SERVICE_VERSION = 'product-eval-catalog-api.v0.3.2';
+const SERVICE_VERSION = 'product-eval-catalog-api.v0.4.1';
 const DATASET_PROFILE = 'source_products_synthetic_variants';
 const EXPECTED_DB_USER = process.env.EXPECTED_DB_USER || 'eval_reader';
 const DB_SSL_MODE = process.env.DB_SSL_MODE || 'require';
@@ -25,13 +25,11 @@ const CURSOR_SIGNING_KEY = process.env.CURSOR_SIGNING_KEY_FILE
 if (IS_MAIN_MODULE && (!CURSOR_SIGNING_KEY || Buffer.byteLength(CURSOR_SIGNING_KEY, 'utf8') < 32)) {
   throw new Error('CURSOR_SIGNING_KEY_FILE or CURSOR_SIGNING_KEY must contain at least 32 bytes');
 }
-const RELEASE_DETAIL_FIELDS = [
+const RELEASE_VERSION_FIELDS = [
   'schemaVersion',
   'catalogVersion',
   'indexVersion',
   'apiVersion',
-  'datasetProfile',
-  'releaseRootSha256',
 ];
 const RELEASE_COUNT_FIELDS = [
   'productCount',
@@ -40,6 +38,29 @@ const RELEASE_COUNT_FIELDS = [
   'searchDocumentCount',
   'multiVariantProductCount',
 ];
+const SHA256_RE = /^[a-f0-9]{64}$/;
+const READINESS_SQL = `
+  select
+    r.snapshot_id,
+    r.source_snapshot_ready,
+    r.eval_v0_1_ready,
+    r.blocking_gap_count,
+    r.readiness_status,
+    r.readiness_details,
+    r.checked_at,
+    m.snapshot_id as manifest_snapshot_id,
+    m."schemaVersion" as manifest_schema_version,
+    m."catalogVersion" as manifest_catalog_version,
+    m."indexVersion" as manifest_index_version,
+    m."apiVersion" as manifest_api_version,
+    m.source_artifact_sha256 as manifest_source_artifact_sha256,
+    m.llm_artifact_sha256 as manifest_llm_artifact_sha256,
+    m.source_snapshot_ready as manifest_source_snapshot_ready,
+    m.eval_v0_1_ready as manifest_eval_v0_1_ready,
+    m.blocking_gap_count as manifest_blocking_gap_count,
+    m.readiness_status as manifest_readiness_status
+  from eval.dataset_readiness r
+  left join eval.snapshot_manifest m on m.snapshot_id = r.snapshot_id`;
 const OCP_QUERY_INPUT_FIELDS = Object.freeze([
   { name: 'query', type: 'string', operators: ['contains', 'prefix', 'eq'], description: 'Optional keyword text. Maximum length: 500 characters.' },
   { name: 'sort_by', type: 'string', operators: ['eq'], description: 'Optional stable sort. Allowed values: relevance, price_asc, price_desc. Default: relevance.' },
@@ -91,7 +112,7 @@ if (IS_MAIN_MODULE) {
             : {}),
         },
     application_name: 'product_eval_catalog_api',
-    options: '-c statement_timeout=15000 -c default_transaction_read_only=on',
+    options: '-c statement_timeout=15000 -c default_transaction_read_only=on -c max_parallel_workers_per_gather=0',
   });
 }
 
@@ -245,7 +266,52 @@ function assertObject(value, label) {
   }
 }
 
-async function readJson(req) {
+// Reject request bodies carrying fields this service does not implement, so a
+// typo ("quiery") or an injected field fails loudly instead of being ignored.
+function rejectUnknownFields(body, allowed, label) {
+  const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new HttpError(400, 'unsupported_field', `${label} contains unsupported fields`, {
+      unsupported: unknown.sort(),
+      allowed: [...allowed].sort(),
+    });
+  }
+}
+
+// Prototype-pollution keys must never survive parsing, even though Node's
+// JSON.parse keeps them as plain own properties.
+function assertNoPollutedKeys(value, path = 'body') {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoPollutedKeys(item, `${path}[${index}]`));
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  for (const key of Object.keys(value)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      throw new HttpError(400, 'invalid_request', `${path} contains a forbidden property name`, { property: key });
+    }
+    assertNoPollutedKeys(value[key], `${path}.${key}`);
+  }
+}
+
+function assertJsonContentType(req) {
+  const header = req.headers['content-type'];
+  if (header === undefined || header === '') {
+    throw new HttpError(415, 'unsupported_media_type', 'content-type: application/json is required', {
+      required: 'application/json',
+    });
+  }
+  const mediaType = String(header).split(';')[0].trim().toLowerCase();
+  if (mediaType !== 'application/json' && !mediaType.endsWith('+json')) {
+    throw new HttpError(415, 'unsupported_media_type', 'content-type must be application/json', {
+      received: mediaType,
+      required: 'application/json',
+    });
+  }
+}
+
+async function readJson(req, { requireBody = true } = {}) {
+  assertJsonContentType(req);
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -256,12 +322,19 @@ async function readJson(req) {
     chunks.push(chunk);
   }
   const raw = Buffer.concat(chunks).toString('utf8').trim();
-  if (!raw) return {};
+  if (!raw) {
+    if (requireBody) throw new HttpError(400, 'invalid_request', 'Request body is required and must be a JSON object');
+    return {};
+  }
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch (error) {
     throw new HttpError(400, 'invalid_json', 'Request body is not valid JSON', { cause: error.message });
   }
+  assertObject(parsed, 'request body');
+  assertNoPollutedKeys(parsed);
+  return parsed;
 }
 
 function parseLimit(value) {
@@ -589,16 +662,26 @@ function addAttributeFilters(where, params, attributeFilters) {
   }
 }
 
-function validateQueryPack(pack) {
-  if (!pack) return 'ocp.query.product-eval.v1';
-  const allowed = new Set(['ocp.query.keyword.v1', 'ocp.query.filter.v1', 'ocp.query.product-eval.v1']);
+const OCP_QUERY_PACKS = Object.freeze(['ocp.query.keyword.v1', 'ocp.query.filter.v1', 'ocp.query.product-eval.v1']);
+
+// /ocp/query is a protocol endpoint: the caller must negotiate a pack
+// explicitly rather than silently inheriting a server-side default.
+function validateQueryPack(pack, { required = false } = {}) {
+  const allowed = new Set(OCP_QUERY_PACKS);
+  if (pack === undefined || pack === null || pack === '') {
+    if (required) {
+      throw new HttpError(400, 'missing_query_pack', 'query_pack is required', { allowed: [...allowed] });
+    }
+    return 'ocp.query.product-eval.v1';
+  }
+  if (typeof pack !== 'string') throw new HttpError(400, 'unsupported_query_pack', 'query_pack must be a string', { allowed: [...allowed] });
   if (!allowed.has(pack)) throw new HttpError(400, 'unsupported_query_pack', 'Unsupported query_pack', { allowed: [...allowed] });
   return pack;
 }
 
 function validateQueryMode(mode) {
   const allowed = new Set(['keyword', 'filter', 'semantic', 'hybrid']);
-  if (!allowed.has(mode)) throw new HttpError(400, 'unsupported_query_mode', 'Unsupported query_mode', { allowed: [...allowed] });
+  if (typeof mode !== 'string' || !allowed.has(mode)) throw new HttpError(400, 'unsupported_query_mode', 'Unsupported query_mode', { allowed: [...allowed] });
   if (mode === 'semantic') {
     throw new HttpError(400, 'unsupported_query_mode', 'semantic mode is not enabled; use keyword/filter/hybrid');
   }
@@ -621,9 +704,12 @@ function validatePackModeCompatibility(queryPack, queryMode) {
   }
 }
 
-function inferQueryMode(input, filters, attributeFilters) {
-  const mode = input.query_mode || input.queryMode;
-  if (mode) return validateQueryMode(mode);
+function inferQueryMode(input, filters, attributeFilters, { required = false } = {}) {
+  const mode = input.query_mode ?? input.queryMode;
+  if (mode !== undefined && mode !== null && mode !== '') return validateQueryMode(mode);
+  if (required) {
+    throw new HttpError(400, 'missing_query_mode', 'query_mode is required', { allowed: ['keyword', 'filter', 'hybrid'] });
+  }
   const hasQuery = !!parseQuery(input.query ?? input.q);
   const hasFilters = Object.keys(filters).length > 0 || attributeFilters.length > 0;
   if (hasQuery && hasFilters) return 'hybrid';
@@ -812,19 +898,52 @@ function toEntry(row, query, filters, attributeFilters, release) {
   };
 }
 
+// Accepted top-level request fields per surface. OCP is the strict protocol
+// shape; the API/MCP surface additionally allows camelCase and attributeFilters.
+// The OCP envelope fields (ocp_version/kind) and the spec-standard request
+// fields the official ocp-cli sends are accepted so conformant clients are not
+// rejected; unknown/typo fields still fail loudly.
+const OCP_QUERY_BODY_FIELDS = new Set([
+  'query_pack', 'query_mode', 'query', 'filters', 'limit', 'sort_by', 'cursor',
+  'ocp_version', 'kind', 'explain', 'offset',
+]);
+const API_SEARCH_BODY_FIELDS = new Set([
+  'query', 'q', 'filters', 'attributeFilters', 'limit', 'sortBy', 'cursor', 'query_mode', 'queryMode',
+]);
+
 async function searchProducts(input, mode) {
   assertObject(input, 'request');
+  const isOcp = mode === 'ocp';
+  rejectUnknownFields(input, isOcp ? OCP_QUERY_BODY_FIELDS : API_SEARCH_BODY_FIELDS, isOcp ? 'CatalogQueryRequest' : 'search request');
+  if (isOcp && input.q !== undefined) {
+    throw new HttpError(400, 'unsupported_field', 'OCP CatalogQueryRequest uses query, not q');
+  }
+  // Pagination is cursor-based. offset is accepted in the envelope for
+  // spec-conformance but a non-zero value would silently return the wrong page.
+  if (isOcp && input.offset !== undefined && input.offset !== null && input.offset !== 0) {
+    throw new HttpError(400, 'unsupported_field', 'offset pagination is not supported; use page.next_cursor', {
+      received: input.offset,
+    });
+  }
   const query = parseQuery(input.query ?? input.q);
-  const filters = validateFilters(input.filters, mode === 'ocp' ? STANDARD_FILTERS : API_FILTERS);
-  if (mode === 'ocp' && input.attributeFilters !== undefined) {
+  const filters = validateFilters(input.filters, isOcp ? STANDARD_FILTERS : API_FILTERS);
+  if (isOcp && input.attributeFilters !== undefined) {
     throw new HttpError(400, 'unsupported_field', 'OCP CatalogQueryRequest does not support attributeFilters; use /api/search or /mcp');
   }
-  const attributeFilters = mode === 'ocp' ? [] : validateAttributeFilters(input.attributeFilters);
+  const attributeFilters = isOcp ? [] : validateAttributeFilters(input.attributeFilters);
   const limit = parseLimit(input.limit);
-  const sortBy = validateSortBy(mode === 'ocp' ? input.sort_by : input.sortBy);
-  const queryPack = mode === 'ocp' ? validateQueryPack(input.query_pack) : 'product-eval.api.search.v1';
-  const queryMode = inferQueryMode(input, filters, attributeFilters);
-  if (mode === 'ocp') validatePackModeCompatibility(queryPack, queryMode);
+  const sortBy = validateSortBy(isOcp ? input.sort_by : input.sortBy);
+  const queryPack = isOcp ? validateQueryPack(input.query_pack, { required: true }) : 'product-eval.api.search.v1';
+  const queryMode = inferQueryMode(input, filters, attributeFilters, { required: isOcp });
+  if (isOcp) validatePackModeCompatibility(queryPack, queryMode);
+  // A keyword/hybrid request with no keyword would otherwise degrade into an
+  // unfiltered table scan that looks like a successful search.
+  if (!query && (queryMode === 'keyword' || queryMode === 'hybrid')) {
+    throw new HttpError(400, 'invalid_query', `query_mode=${queryMode} requires a non-empty query`, { query_mode: queryMode });
+  }
+  if (queryMode === 'filter' && Object.keys(filters).length === 0 && attributeFilters.length === 0) {
+    throw new HttpError(400, 'invalid_query', 'query_mode=filter requires at least one filter', { query_mode: queryMode });
+  }
   const release = await activeRelease();
   const fingerprint = requestFingerprint({ query, filters, attributeFilters, limit, sortBy, queryPack, queryMode });
   const cursor = parseCursor(input.cursor, release, fingerprint, sortBy);
@@ -899,9 +1018,88 @@ async function readOnlyCheck() {
   };
 }
 
-async function resolveProduct(entryId) {
+const OCP_RESOLVE_PACKS = Object.freeze(['ocp.resolve.product.v1', 'ocp.resolve.product-eval.v1']);
+const OCP_RESOLVE_MODES = Object.freeze(['exact', 'live']);
+const OCP_RESOLVE_PURPOSES = Object.freeze(['view', 'checkout', 'contact', 'workflow']);
+// entry_id plus the standard OCP ResolveRequest envelope/spec fields the
+// official ocp-cli sends. Anything outside this set is a client bug.
+const OCP_RESOLVE_BODY_FIELDS = new Set([
+  'entry_id', 'entryId', 'object_id', 'query_pack', 'query_mode', 'response_mode',
+  'ocp_version', 'kind', 'purpose', 'live_check', 'requested_fields',
+]);
+const API_RESOLVE_BODY_FIELDS = new Set(['entry_id', 'entryId', 'productId', 'response_mode']);
+
+function validateResolvePurpose(purpose) {
+  const allowed = new Set(OCP_RESOLVE_PURPOSES);
+  if (purpose === undefined || purpose === null || purpose === '') return 'view';
+  if (typeof purpose !== 'string' || !allowed.has(purpose)) {
+    throw new HttpError(400, 'unsupported_purpose', 'Unsupported resolve purpose', { allowed: [...allowed] });
+  }
+  return purpose;
+}
+
+function validateRequestedFields(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new HttpError(400, 'invalid_request', 'requested_fields must be an array of strings');
+  for (const field of value) {
+    if (typeof field !== 'string' || !field.trim()) {
+      throw new HttpError(400, 'invalid_request', 'requested_fields entries must be non-empty strings');
+    }
+  }
+  return value;
+}
+
+function validateLiveCheck(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== 'boolean') throw new HttpError(400, 'invalid_request', 'live_check must be a boolean');
+  return value;
+}
+
+// Resolve accepts a pack/mode ("款式") so callers can negotiate it like /ocp/query,
+// but the pack only selects verification depth -- it never changes the projection.
+function validateResolvePack(pack) {
+  const allowed = new Set(OCP_RESOLVE_PACKS);
+  if (pack === undefined || pack === null || pack === '') return 'ocp.resolve.product.v1';
+  if (typeof pack !== 'string' || !allowed.has(pack)) {
+    throw new HttpError(400, 'unsupported_resolve_pack', 'Unsupported query_pack for resolve', { allowed: [...allowed] });
+  }
+  return pack;
+}
+
+function validateResolveMode(mode) {
+  const allowed = new Set(OCP_RESOLVE_MODES);
+  if (mode === undefined || mode === null || mode === '') return 'exact';
+  if (typeof mode !== 'string' || !allowed.has(mode)) {
+    throw new HttpError(400, 'unsupported_resolve_mode', 'Unsupported query_mode for resolve', { allowed: [...allowed] });
+  }
+  return mode;
+}
+
+function validateResponseMode(mode) {
+  const allowed = new Set(['full', 'status']);
+  if (mode === undefined || mode === null || mode === '') return 'full';
+  if (typeof mode !== 'string' || !allowed.has(mode)) {
+    throw new HttpError(400, 'unsupported_response_mode', 'response_mode must be full or status', { allowed: [...allowed] });
+  }
+  return mode;
+}
+
+function requireEntryId(value, name = 'entry_id') {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new HttpError(400, 'invalid_entry_id', `${name} must be a non-empty string`);
+  }
+  const trimmed = value.trim();
+  if (trimmed.length > 128) {
+    throw new HttpError(400, 'invalid_entry_id', `${name} must be at most 128 characters`);
+  }
+  return trimmed;
+}
+
+async function resolveProduct(entryId, options = {}) {
+  const resolvePack = options.resolvePack ?? 'ocp.resolve.product.v1';
+  const resolveMode = options.resolveMode ?? 'exact';
   const release = await activeRelease();
-  const row = await fetchProductRow(requireString(entryId, 'entry_id'));
+  const row = await fetchProductRow(requireEntryId(entryId, options.idFieldName ?? 'entry_id'));
   assertRowReleaseIdentity(row.version, release);
   const dbReadOnly = await readOnlyCheck();
   if (!dbReadOnly.passed) {
@@ -920,6 +1118,9 @@ async function resolveProduct(entryId) {
     id: `res_${crypto.randomUUID()}`,
     catalog_id: CATALOG_ID,
     ...releaseIdentity(release),
+    query_pack: resolvePack,
+    query_mode: resolveMode,
+    purpose: options.purpose ?? 'view',
     entry_id: product.productId,
     commercial_object_id: product.productId,
     object_id: product.productId,
@@ -957,6 +1158,72 @@ async function resolveProduct(entryId) {
   };
 }
 
+// Compact success/failure projection of a full resolve, for callers that only
+// need to know whether the reference is still resolvable.
+function toResolveStatus(resolved) {
+  return {
+    ocp_version: '1.0',
+    kind: 'ResolveResult',
+    id: resolved.id,
+    catalog_id: resolved.catalog_id,
+    snapshotId: resolved.snapshotId,
+    catalogVersion: resolved.catalogVersion,
+    query_pack: resolved.query_pack,
+    query_mode: resolved.query_mode,
+    purpose: resolved.purpose,
+    response_mode: 'status',
+    entry_id: resolved.entry_id,
+    object_type: resolved.object_type,
+    status: 'success',
+    resolved: true,
+    checks_passed: resolved.live_checks.every((check) => check.status === 'passed'),
+    live_checks: resolved.live_checks.map((check) => ({ check_id: check.check_id, status: check.status })),
+    resolved_at: resolved.freshness.resolved_at,
+    expires_at: resolved.expires_at,
+  };
+}
+
+// Failure counterpart of toResolveStatus: same envelope, status="failed".
+function toResolveFailure(error, context) {
+  return {
+    ocp_version: '1.0',
+    kind: 'ResolveResult',
+    catalog_id: CATALOG_ID,
+    query_pack: context.resolvePack,
+    query_mode: context.resolveMode,
+    response_mode: 'status',
+    ...(context.entryId !== undefined ? { entry_id: context.entryId } : {}),
+    status: 'failed',
+    resolved: false,
+    checks_passed: false,
+    error: { code: error.code, message: error.message, details: error.details },
+  };
+}
+
+async function ocpResolve(body) {
+  assertObject(body, 'ResolveRequest');
+  rejectUnknownFields(body, OCP_RESOLVE_BODY_FIELDS, 'ResolveRequest');
+  const resolvePack = validateResolvePack(body.query_pack);
+  const resolveMode = validateResolveMode(body.query_mode);
+  const responseMode = validateResponseMode(body.response_mode);
+  const purpose = validateResolvePurpose(body.purpose);
+  validateRequestedFields(body.requested_fields);
+  validateLiveCheck(body.live_check);
+  const rawEntryId = body.entry_id ?? body.entryId ?? body.object_id;
+  const entryId = requireEntryId(rawEntryId);
+  try {
+    const resolved = await resolveProduct(entryId, { resolvePack, resolveMode, purpose });
+    return { status: 200, payload: responseMode === 'status' ? toResolveStatus(resolved) : resolved };
+  } catch (error) {
+    // In status mode a miss is still a well-formed answer: report it in the
+    // ResolveResult envelope instead of a bare error object.
+    if (responseMode === 'status' && error instanceof HttpError) {
+      return { status: error.status, payload: toResolveFailure(error, { resolvePack, resolveMode, entryId }) };
+    }
+    throw error;
+  }
+}
+
 async function apiResolveProduct(entryId) {
   const resolved = await resolveProduct(entryId);
   return {
@@ -974,7 +1241,7 @@ async function listProductVariants(productId) {
       'variantId', v."variantId", 'productId', v."productId", 'sku', v.sku,
       'variantTitleZh', v."variantTitleZh", 'variantTitleEn', v."variantTitleEn",
       'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes",
-      'isActive', v."isActive", 'classificationStatus', v."classificationStatus",
+      'isActive', v."isActive",
       'schemaVersion', v."schemaVersion", 'catalogVersion', v."catalogVersion", 'snapshotId', v.snapshot_id,
       'offer', jsonb_build_object(
         'offerId', o."offerId", 'variantId', o."variantId", 'price', o.price, 'currency', o.currency,
@@ -987,7 +1254,7 @@ async function listProductVariants(productId) {
     join eval.offers o on o."variantId" = v."variantId"
     where v."productId" = $1
     order by v."variantId" asc
-    limit 50`, [requireString(productId, 'productId')]);
+    limit 50`, [requireEntryId(productId, 'productId')]);
   if (result.rowCount === 0) throw new HttpError(404, 'product_not_found', `No variants found for ${productId}`);
   for (const row of result.rows) {
     if (
@@ -995,7 +1262,7 @@ async function listProductVariants(productId) {
       || row.variant?.catalogVersion !== release.catalogVersion
       || row.variant?.snapshotId !== release.snapshotId
     ) {
-      throw new HttpError(503, 'release_identity_inconsistent', 'Variant row release identity does not match eval.dataset_readiness', {
+      throw new HttpError(503, 'release_identity_inconsistent', 'Variant row release identity does not match the active snapshot manifest', {
         variantId: row.variant?.variantId,
       });
     }
@@ -1003,22 +1270,29 @@ async function listProductVariants(productId) {
   return { productId, version: projectVersion(releaseIdentity(release)), variants: result.rows.map((row) => projectVariantWithOffer(row.variant)) };
 }
 
-async function readiness() {
-  const result = await pool.query('select snapshot_id, eval_v0_1_ready, blocking_gap_count, readiness_status, readiness_details, checked_at from eval.dataset_readiness');
+async function readiness(database = pool) {
+  const result = await database.query(READINESS_SQL);
   if (result.rowCount !== 1) {
-    throw new HttpError(503, 'dataset_readiness_invalid', 'eval.dataset_readiness must expose exactly one authoritative row', {
+    throw new HttpError(503, 'dataset_readiness_invalid', 'The active readiness and snapshot manifest must resolve to exactly one row', {
       rowCount: result.rowCount,
     });
   }
   return result.rows[0];
 }
 
-function requireReadinessString(details, key) {
-  const value = details[key];
+function requireNonEmptyString(value, label, code = 'dataset_readiness_invalid') {
   if (typeof value !== 'string' || !value.trim()) {
-    throw new HttpError(503, 'dataset_readiness_invalid', `readiness_details.${key} is missing or invalid`);
+    throw new HttpError(503, code, `${label} is missing or invalid`);
   }
-  return value;
+  return value.trim();
+}
+
+function requireSha256(value, label, code = 'dataset_manifest_invalid') {
+  const digest = requireNonEmptyString(value, label, code);
+  if (!SHA256_RE.test(digest)) {
+    throw new HttpError(503, code, `${label} must be a lowercase SHA-256 digest`);
+  }
+  return digest;
 }
 
 function requireReadinessCount(details, key) {
@@ -1030,8 +1304,14 @@ function requireReadinessCount(details, key) {
 }
 
 function parseActiveRelease(ready) {
-  if (ready.eval_v0_1_ready !== true || ready.blocking_gap_count !== 0 || ready.readiness_status !== 'eval_v0_1_ready') {
+  if (
+    ready.source_snapshot_ready !== true
+    || ready.eval_v0_1_ready !== true
+    || ready.blocking_gap_count !== 0
+    || ready.readiness_status !== 'eval_v0_1_ready'
+  ) {
     throw new HttpError(503, 'dataset_not_ready', 'The active evaluation release is not ready', {
+      sourceSnapshotReady: ready.source_snapshot_ready,
       evalV01Ready: ready.eval_v0_1_ready,
       blockingGapCount: ready.blocking_gap_count,
       readinessStatus: ready.readiness_status,
@@ -1044,16 +1324,66 @@ function parseActiveRelease(ready) {
   if (!snapshotId) throw new HttpError(503, 'dataset_readiness_invalid', 'snapshot_id is missing or invalid');
 
   const details = ready.readiness_details;
-  const releaseDetails = Object.fromEntries(RELEASE_DETAIL_FIELDS.map((key) => [key, requireReadinessString(details, key)]));
-  if (releaseDetails.datasetProfile !== DATASET_PROFILE) {
-    throw new HttpError(503, 'dataset_readiness_invalid', 'readiness_details.datasetProfile does not match the supported dataset profile', {
-      expected: DATASET_PROFILE,
-      actual: releaseDetails.datasetProfile,
+  const manifestSnapshotId = requireNonEmptyString(
+    ready.manifest_snapshot_id,
+    'snapshot_manifest.snapshot_id',
+    'dataset_manifest_invalid',
+  );
+  if (manifestSnapshotId !== snapshotId) {
+    throw new HttpError(503, 'release_identity_inconsistent', 'snapshot_manifest.snapshot_id does not match dataset_readiness.snapshot_id', {
+      expected: snapshotId,
+      actual: manifestSnapshotId,
     });
   }
-  if (!/^[a-f0-9]{64}$/.test(releaseDetails.releaseRootSha256)) {
-    throw new HttpError(503, 'dataset_readiness_invalid', 'readiness_details.releaseRootSha256 must be a lowercase SHA-256 digest');
+  if (
+    ready.manifest_source_snapshot_ready !== true
+    || ready.manifest_eval_v0_1_ready !== true
+    || ready.manifest_blocking_gap_count !== 0
+    || ready.manifest_readiness_status !== 'eval_v0_1_ready'
+  ) {
+    throw new HttpError(503, 'dataset_manifest_invalid', 'The active snapshot manifest is not ready', {
+      sourceSnapshotReady: ready.manifest_source_snapshot_ready,
+      evalV01Ready: ready.manifest_eval_v0_1_ready,
+      blockingGapCount: ready.manifest_blocking_gap_count,
+      readinessStatus: ready.manifest_readiness_status,
+    });
   }
+
+  const manifestFields = {
+    schemaVersion: 'manifest_schema_version',
+    catalogVersion: 'manifest_catalog_version',
+    indexVersion: 'manifest_index_version',
+    apiVersion: 'manifest_api_version',
+  };
+  const releaseIdentityDetails = Object.fromEntries(RELEASE_VERSION_FIELDS.map((key) => [
+    key,
+    requireNonEmptyString(ready[manifestFields[key]], `snapshot_manifest.${key}`, 'dataset_manifest_invalid'),
+  ]));
+  for (const key of RELEASE_VERSION_FIELDS) {
+    if (details[key] === undefined) continue;
+    const legacyValue = requireNonEmptyString(details[key], `readiness_details.${key}`);
+    if (legacyValue !== releaseIdentityDetails[key]) {
+      throw new HttpError(503, 'release_identity_inconsistent', `readiness_details.${key} does not match snapshot_manifest.${key}`, {
+        expected: releaseIdentityDetails[key],
+        actual: legacyValue,
+      });
+    }
+  }
+
+  const datasetProfile = requireNonEmptyString(details.datasetProfile, 'readiness_details.datasetProfile');
+  if (datasetProfile !== DATASET_PROFILE) {
+    throw new HttpError(503, 'dataset_readiness_invalid', 'readiness_details.datasetProfile does not match the supported dataset profile', {
+      expected: DATASET_PROFILE,
+      actual: datasetProfile,
+    });
+  }
+  const artifactHashes = {
+    sourceArtifactSha256: requireSha256(ready.manifest_source_artifact_sha256, 'snapshot_manifest.source_artifact_sha256'),
+    llmArtifactSha256: requireSha256(ready.manifest_llm_artifact_sha256, 'snapshot_manifest.llm_artifact_sha256'),
+  };
+  const releaseRootSha256 = details.releaseRootSha256 === undefined
+    ? undefined
+    : requireSha256(details.releaseRootSha256, 'readiness_details.releaseRootSha256', 'dataset_readiness_invalid');
   const counts = Object.fromEntries(RELEASE_COUNT_FIELDS.map((key) => [key, requireReadinessCount(details, key)]));
   if (counts.variantCount !== counts.offerCount || counts.variantCount !== counts.searchDocumentCount) {
     throw new HttpError(503, 'dataset_readiness_invalid', 'Variant, Offer, and search document counts must be identical', counts);
@@ -1062,7 +1392,7 @@ function parseActiveRelease(ready) {
     throw new HttpError(503, 'dataset_readiness_invalid', 'readiness counts violate Product/Variant cardinality invariants', counts);
   }
   if (details.stableEvalPublicationSwitched !== true) {
-    throw new HttpError(503, 'dataset_not_published', 'The v15 release is built but the stable eval publication has not been activated');
+    throw new HttpError(503, 'dataset_not_published', 'The active release is built but the stable eval publication has not been activated');
   }
   const checkedAt = new Date(ready.checked_at);
   if (Number.isNaN(checkedAt.getTime())) {
@@ -1070,7 +1400,10 @@ function parseActiveRelease(ready) {
   }
   return {
     snapshotId,
-    ...releaseDetails,
+    ...releaseIdentityDetails,
+    datasetProfile,
+    ...artifactHashes,
+    ...(releaseRootSha256 === undefined ? {} : { releaseRootSha256 }),
     ...counts,
     checkedAt: checkedAt.toISOString(),
   };
@@ -1094,7 +1427,7 @@ function assertRowReleaseIdentity(version, release) {
   const expected = releaseIdentity(release);
   for (const key of ['schemaVersion', 'catalogVersion', 'indexVersion', 'apiVersion', 'snapshotId']) {
     if (version?.[key] !== expected[key]) {
-      throw new HttpError(503, 'release_identity_inconsistent', `Database row ${key} does not match eval.dataset_readiness`, {
+      throw new HttpError(503, 'release_identity_inconsistent', `Database row ${key} does not match the active snapshot manifest`, {
         expected: expected[key],
         actual: version?.[key],
       });
@@ -1105,6 +1438,9 @@ function assertRowReleaseIdentity(version, release) {
 function manifestObjectContracts() {
   return [
     {
+      object_type: 'Product',
+      name: 'Product',
+      description: 'Baseline catalog product object exposed to evaluated agents.',
       required_fields: [
         'product#/productId', 'product#/categoryCode', 'product#/categoryNameZh', 'product#/categoryNameEn',
         'product#/productTypeCode', 'product#/productTypeNameZh', 'product#/productTypeNameEn',
@@ -1122,6 +1458,9 @@ function manifestObjectContracts() {
       },
     },
     {
+      object_type: 'ProductVariant',
+      name: 'ProductVariant',
+      description: 'Concrete purchasable product variant with structured option values.',
       required_fields: [
         'variant#/variantId', 'variant#/productId', 'variant#/sku',
         'variant#/variantTitleZh', 'variant#/variantTitleEn', 'variant#/optionValues',
@@ -1136,6 +1475,9 @@ function manifestObjectContracts() {
       },
     },
     {
+      object_type: 'Offer',
+      name: 'Offer',
+      description: 'Variant-level price, inventory, and saleability snapshot.',
       required_fields: [
         'offer#/offerId', 'offer#/variantId', 'offer#/price', 'offer#/currency',
         'offer#/listPrice', 'offer#/inventoryStatus', 'offer#/inventoryQuantity',
@@ -1168,6 +1510,23 @@ function buildManifest(release) {
       health: { url: `${PUBLIC_BASE_URL}/ocp/health`, method: 'GET' },
       query: { url: `${PUBLIC_BASE_URL}/ocp/query`, method: 'POST' },
       resolve: { url: `${PUBLIC_BASE_URL}/ocp/resolve`, method: 'POST' },
+    },
+    resolve_capability: {
+      capability_id: 'product_eval_resolve_v1',
+      name: 'Product entry resolve with success/failure status mode',
+      description: 'Resolve one product entry_id. query_pack/query_mode select verification depth; response_mode=status returns only success/failure plus live-check results.',
+      query_packs: [
+        { pack_id: 'ocp.resolve.product.v1', query_modes: [...OCP_RESOLVE_MODES], description: 'Resolve a product entry by exact entry_id.' },
+        { pack_id: 'ocp.resolve.product-eval.v1', query_modes: [...OCP_RESOLVE_MODES], description: 'Product eval alias of the product resolve pack.' },
+      ],
+      response_modes: [
+        { mode: 'full', description: 'Default. Returns the full ResolvableReference including visible_attributes.' },
+        { mode: 'status', description: 'Returns a compact ResolveResult with status success/failed, resolved, and checks_passed only.' },
+      ],
+      required_input_fields: ['entry_id'],
+      accepted_input_fields: [...OCP_RESOLVE_BODY_FIELDS].sort(),
+      purposes: [...OCP_RESOLVE_PURPOSES],
+      strict_request_validation: true,
     },
     query_capabilities: [{
       capability_id: 'product_eval_search_v1',
@@ -1209,6 +1568,11 @@ function buildManifest(release) {
           page_size: { default: 20, minimum: 1, maximum: 50 },
           sort_by: ['relevance', 'price_asc', 'price_desc'],
           currency: ['CNY'],
+          strict_request_validation: true,
+          required_request_fields: ['query_pack', 'query_mode'],
+          required_content_type: 'application/json',
+          rejects_unknown_request_fields: true,
+          allowed_request_fields: [...OCP_QUERY_BODY_FIELDS].sort(),
         },
         structured_attribute_filters: {
           api_url: `${PUBLIC_BASE_URL}/api/search`,
@@ -1479,6 +1843,41 @@ Use \`entries[0].entry.entry_id\` from query:
 ocp catalog resolve --resolve-url ${PUBLIC_BASE_URL}/ocp/resolve --entry-id <productId>
 \`\`\`
 
+Resolve accepts an optional pack/mode, and \`response_mode\` selects how much of
+the reference is returned. \`full\` (default) returns the whole
+\`ResolvableReference\`; \`status\` returns only whether the entry resolved.
+
+\`\`\`bash
+curl -sS ${PUBLIC_BASE_URL}/ocp/resolve \\
+  -H 'content-type: application/json' \\
+  -d '{
+    "entry_id": "<productId>",
+    "query_pack": "ocp.resolve.product.v1",
+    "query_mode": "exact",
+    "response_mode": "status"
+  }'
+\`\`\`
+
+Status mode answers with \`kind: "ResolveResult"\` and
+\`status: "success" | "failed"\`, plus \`resolved\` and \`checks_passed\`. A missing
+entry returns HTTP 404 in the same envelope with \`status: "failed"\` rather than
+a bare error, so success and failure are distinguishable without parsing the
+product payload.
+
+Resolve packs: \`ocp.resolve.product.v1\`, \`ocp.resolve.product-eval.v1\`.
+Resolve modes: \`exact\`, \`live\`.
+
+## Request validation
+
+The service rejects malformed requests instead of silently coercing them:
+
+- \`content-type: application/json\` is required on every POST; anything else is \`415 unsupported_media_type\`.
+- Unknown top-level request fields are rejected with \`400 unsupported_field\` and the allowed list, so a typo never degrades into an ignored filter.
+- \`/ocp/query\` requires explicit \`query_pack\` and \`query_mode\`; omitting either is \`400 missing_query_pack\` / \`400 missing_query_mode\`.
+- \`query_mode=keyword|hybrid\` requires a non-empty \`query\`; \`query_mode=filter\` requires at least one filter.
+- \`__proto__\`, \`constructor\`, and \`prototype\` property names are refused anywhere in the body.
+- A wrong HTTP method on a known path returns \`405 method_not_allowed\` with an \`Allow\` header, not \`404\`.
+
 ## Structured attribute search API
 
 OCP CLI currently accepts only fixed standard filter keys. For dynamic attributes such as color, size, capacity, and configuration, use API/MCP:
@@ -1517,6 +1916,22 @@ actual matched structured attributes and the active release identity.
 `;
 }
 
+// Declared method(s) per known path, so a wrong-method request answers 405
+// with an Allow header instead of a misleading 404.
+const ROUTE_METHODS = Object.freeze({
+  '/': ['GET'],
+  '/docs': ['GET'],
+  '/usage.md': ['GET'],
+  '/ocp/health': ['GET'],
+  '/ocp/manifest': ['GET'],
+  '/ocp/query': ['POST'],
+  '/ocp/resolve': ['POST'],
+  '/api/search': ['POST'],
+  '/api/resolve': ['POST'],
+  '/api/variants': ['POST'],
+  '/mcp': ['POST'],
+});
+
 async function route(req, res) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'OPTIONS') {
@@ -1531,7 +1946,15 @@ async function route(req, res) {
   }
 
   const cors = { 'access-control-allow-origin': '*' };
-  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/docs')) {
+  const allowedMethods = ROUTE_METHODS[url.pathname];
+  if (!allowedMethods) {
+    throw new HttpError(404, 'not_found', `No route for ${req.method} ${url.pathname}`);
+  }
+  if (!allowedMethods.includes(req.method)) {
+    throw new HttpError(405, 'method_not_allowed', `${req.method} is not allowed for ${url.pathname}`, { allowed: allowedMethods });
+  }
+
+  if (url.pathname === '/' || url.pathname === '/docs') {
     return sendJson(res, 200, {
       service: 'Deeplumen Product Eval Catalog',
       version: SERVICE_VERSION,
@@ -1543,26 +1966,34 @@ async function route(req, res) {
       usage: `${PUBLIC_BASE_URL}/usage.md`,
     }, cors);
   }
-  if (req.method === 'GET' && url.pathname === '/usage.md') return sendText(res, 200, usageMarkdown(), 'text/markdown; charset=utf-8');
-  if (req.method === 'GET' && url.pathname === '/ocp/health') {
+  if (url.pathname === '/usage.md') return sendText(res, 200, usageMarkdown(), 'text/markdown; charset=utf-8');
+  if (url.pathname === '/ocp/health') {
     return sendJson(res, 200, buildHealth(await activeRelease()), cors);
   }
-  if (req.method === 'GET' && url.pathname === '/ocp/manifest') return sendJson(res, 200, await manifest(), cors);
-  if (req.method === 'POST' && url.pathname === '/ocp/query') return sendJson(res, 200, await ocpQuery(await readJson(req)), cors);
-  if (req.method === 'POST' && url.pathname === '/ocp/resolve') {
-    const body = await readJson(req);
-    return sendJson(res, 200, await resolveProduct(body.entry_id), cors);
+  if (url.pathname === '/ocp/manifest') return sendJson(res, 200, await manifest(), cors);
+  if (url.pathname === '/ocp/query') return sendJson(res, 200, await ocpQuery(await readJson(req)), cors);
+  if (url.pathname === '/ocp/resolve') {
+    const { status, payload } = await ocpResolve(await readJson(req));
+    return sendJson(res, status, payload, cors);
   }
-  if (req.method === 'POST' && url.pathname === '/api/search') return sendJson(res, 200, await apiSearch(await readJson(req)), cors);
-  if (req.method === 'POST' && url.pathname === '/api/resolve') {
+  if (url.pathname === '/api/search') return sendJson(res, 200, await apiSearch(await readJson(req)), cors);
+  if (url.pathname === '/api/resolve') {
     const body = await readJson(req);
-    return sendJson(res, 200, await apiResolveProduct(body.productId || body.entryId || body.entry_id), cors);
+    rejectUnknownFields(body, API_RESOLVE_BODY_FIELDS, 'resolve request');
+    const responseMode = validateResponseMode(body.response_mode);
+    const entryId = requireEntryId(body.productId ?? body.entryId ?? body.entry_id, 'productId');
+    if (responseMode === 'status') {
+      const { status, payload } = await ocpResolve({ entry_id: entryId, response_mode: 'status' });
+      return sendJson(res, status, payload, cors);
+    }
+    return sendJson(res, 200, await apiResolveProduct(entryId), cors);
   }
-  if (req.method === 'POST' && url.pathname === '/api/variants') {
+  if (url.pathname === '/api/variants') {
     const body = await readJson(req);
-    return sendJson(res, 200, await listProductVariants(body.productId), cors);
+    rejectUnknownFields(body, new Set(['productId', 'entryId', 'entry_id']), 'variants request');
+    return sendJson(res, 200, await listProductVariants(body.productId ?? body.entryId ?? body.entry_id), cors);
   }
-  if (req.method === 'POST' && url.pathname === '/mcp') return sendJson(res, 200, await mcp(await readJson(req)), cors);
+  if (url.pathname === '/mcp') return sendJson(res, 200, await mcp(await readJson(req)), cors);
   throw new HttpError(404, 'not_found', `No route for ${req.method} ${url.pathname}`);
 }
 
@@ -1575,7 +2006,11 @@ const server = http.createServer((req, res) => {
     if (!(error instanceof HttpError)) {
       console.error('Unhandled request error', error);
     }
-    sendJson(res, status, payload, { 'access-control-allow-origin': '*' });
+    const headers = { 'access-control-allow-origin': '*' };
+    if (status === 405 && Array.isArray(error.details?.allowed)) {
+      headers.allow = error.details.allowed.join(', ');
+    }
+    sendJson(res, status, payload, headers);
   });
 });
 
@@ -1593,7 +2028,12 @@ if (IS_MAIN_MODULE) {
 export {
   HttpError,
   OCP_QUERY_INPUT_FIELDS,
+  OCP_QUERY_BODY_FIELDS,
+  OCP_RESOLVE_BODY_FIELDS,
+  OCP_RESOLVE_PURPOSES,
+  ROUTE_METHODS,
   attributeMatchesFilter,
+  assertNoPollutedKeys,
   buildHealth,
   buildManifest,
   buildSearchSql,
@@ -1601,10 +2041,21 @@ export {
   matchedAttribute,
   parseActiveRelease,
   parseCursor,
+  readiness,
+  rejectUnknownFields,
   requestFingerprint,
+  requireEntryId,
   releaseIdentity,
   redactAgentHiddenResponseFields,
   summarizeHit,
+  toResolveStatus,
   usageMarkdown,
   validateAttributeFilters,
+  validateQueryPack,
+  validateLiveCheck,
+  validateRequestedFields,
+  validateResolvePack,
+  validateResolveMode,
+  validateResolvePurpose,
+  validateResponseMode,
 };
