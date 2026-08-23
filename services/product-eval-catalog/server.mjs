@@ -10,7 +10,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://data.deeplumen.io').replace(/\/+$/, '');
 const CATALOG_ID = 'cat_product_eval_100k_v01';
 const PROVIDER_ID = 'deeplumen_product_eval';
-const SERVICE_VERSION = 'product-eval-catalog-api.v0.4.0';
+const SERVICE_VERSION = 'product-eval-catalog-api.v0.4.1';
 const DATASET_PROFILE = 'source_products_synthetic_variants';
 const EXPECTED_DB_USER = process.env.EXPECTED_DB_USER || 'eval_reader';
 const DB_SSL_MODE = process.env.DB_SSL_MODE || 'require';
@@ -25,13 +25,11 @@ const CURSOR_SIGNING_KEY = process.env.CURSOR_SIGNING_KEY_FILE
 if (IS_MAIN_MODULE && (!CURSOR_SIGNING_KEY || Buffer.byteLength(CURSOR_SIGNING_KEY, 'utf8') < 32)) {
   throw new Error('CURSOR_SIGNING_KEY_FILE or CURSOR_SIGNING_KEY must contain at least 32 bytes');
 }
-const RELEASE_DETAIL_FIELDS = [
+const RELEASE_VERSION_FIELDS = [
   'schemaVersion',
   'catalogVersion',
   'indexVersion',
   'apiVersion',
-  'datasetProfile',
-  'releaseRootSha256',
 ];
 const RELEASE_COUNT_FIELDS = [
   'productCount',
@@ -40,6 +38,29 @@ const RELEASE_COUNT_FIELDS = [
   'searchDocumentCount',
   'multiVariantProductCount',
 ];
+const SHA256_RE = /^[a-f0-9]{64}$/;
+const READINESS_SQL = `
+  select
+    r.snapshot_id,
+    r.source_snapshot_ready,
+    r.eval_v0_1_ready,
+    r.blocking_gap_count,
+    r.readiness_status,
+    r.readiness_details,
+    r.checked_at,
+    m.snapshot_id as manifest_snapshot_id,
+    m."schemaVersion" as manifest_schema_version,
+    m."catalogVersion" as manifest_catalog_version,
+    m."indexVersion" as manifest_index_version,
+    m."apiVersion" as manifest_api_version,
+    m.source_artifact_sha256 as manifest_source_artifact_sha256,
+    m.llm_artifact_sha256 as manifest_llm_artifact_sha256,
+    m.source_snapshot_ready as manifest_source_snapshot_ready,
+    m.eval_v0_1_ready as manifest_eval_v0_1_ready,
+    m.blocking_gap_count as manifest_blocking_gap_count,
+    m.readiness_status as manifest_readiness_status
+  from eval.dataset_readiness r
+  left join eval.snapshot_manifest m on m.snapshot_id = r.snapshot_id`;
 const OCP_QUERY_INPUT_FIELDS = Object.freeze([
   { name: 'query', type: 'string', operators: ['contains', 'prefix', 'eq'], description: 'Optional keyword text. Maximum length: 500 characters.' },
   { name: 'sort_by', type: 'string', operators: ['eq'], description: 'Optional stable sort. Allowed values: relevance, price_asc, price_desc. Default: relevance.' },
@@ -1241,7 +1262,7 @@ async function listProductVariants(productId) {
       || row.variant?.catalogVersion !== release.catalogVersion
       || row.variant?.snapshotId !== release.snapshotId
     ) {
-      throw new HttpError(503, 'release_identity_inconsistent', 'Variant row release identity does not match eval.dataset_readiness', {
+      throw new HttpError(503, 'release_identity_inconsistent', 'Variant row release identity does not match the active snapshot manifest', {
         variantId: row.variant?.variantId,
       });
     }
@@ -1249,22 +1270,29 @@ async function listProductVariants(productId) {
   return { productId, version: projectVersion(releaseIdentity(release)), variants: result.rows.map((row) => projectVariantWithOffer(row.variant)) };
 }
 
-async function readiness() {
-  const result = await pool.query('select snapshot_id, eval_v0_1_ready, blocking_gap_count, readiness_status, readiness_details, checked_at from eval.dataset_readiness');
+async function readiness(database = pool) {
+  const result = await database.query(READINESS_SQL);
   if (result.rowCount !== 1) {
-    throw new HttpError(503, 'dataset_readiness_invalid', 'eval.dataset_readiness must expose exactly one authoritative row', {
+    throw new HttpError(503, 'dataset_readiness_invalid', 'The active readiness and snapshot manifest must resolve to exactly one row', {
       rowCount: result.rowCount,
     });
   }
   return result.rows[0];
 }
 
-function requireReadinessString(details, key) {
-  const value = details[key];
+function requireNonEmptyString(value, label, code = 'dataset_readiness_invalid') {
   if (typeof value !== 'string' || !value.trim()) {
-    throw new HttpError(503, 'dataset_readiness_invalid', `readiness_details.${key} is missing or invalid`);
+    throw new HttpError(503, code, `${label} is missing or invalid`);
   }
-  return value;
+  return value.trim();
+}
+
+function requireSha256(value, label, code = 'dataset_manifest_invalid') {
+  const digest = requireNonEmptyString(value, label, code);
+  if (!SHA256_RE.test(digest)) {
+    throw new HttpError(503, code, `${label} must be a lowercase SHA-256 digest`);
+  }
+  return digest;
 }
 
 function requireReadinessCount(details, key) {
@@ -1276,8 +1304,14 @@ function requireReadinessCount(details, key) {
 }
 
 function parseActiveRelease(ready) {
-  if (ready.eval_v0_1_ready !== true || ready.blocking_gap_count !== 0 || ready.readiness_status !== 'eval_v0_1_ready') {
+  if (
+    ready.source_snapshot_ready !== true
+    || ready.eval_v0_1_ready !== true
+    || ready.blocking_gap_count !== 0
+    || ready.readiness_status !== 'eval_v0_1_ready'
+  ) {
     throw new HttpError(503, 'dataset_not_ready', 'The active evaluation release is not ready', {
+      sourceSnapshotReady: ready.source_snapshot_ready,
       evalV01Ready: ready.eval_v0_1_ready,
       blockingGapCount: ready.blocking_gap_count,
       readinessStatus: ready.readiness_status,
@@ -1290,16 +1324,66 @@ function parseActiveRelease(ready) {
   if (!snapshotId) throw new HttpError(503, 'dataset_readiness_invalid', 'snapshot_id is missing or invalid');
 
   const details = ready.readiness_details;
-  const releaseDetails = Object.fromEntries(RELEASE_DETAIL_FIELDS.map((key) => [key, requireReadinessString(details, key)]));
-  if (releaseDetails.datasetProfile !== DATASET_PROFILE) {
-    throw new HttpError(503, 'dataset_readiness_invalid', 'readiness_details.datasetProfile does not match the supported dataset profile', {
-      expected: DATASET_PROFILE,
-      actual: releaseDetails.datasetProfile,
+  const manifestSnapshotId = requireNonEmptyString(
+    ready.manifest_snapshot_id,
+    'snapshot_manifest.snapshot_id',
+    'dataset_manifest_invalid',
+  );
+  if (manifestSnapshotId !== snapshotId) {
+    throw new HttpError(503, 'release_identity_inconsistent', 'snapshot_manifest.snapshot_id does not match dataset_readiness.snapshot_id', {
+      expected: snapshotId,
+      actual: manifestSnapshotId,
     });
   }
-  if (!/^[a-f0-9]{64}$/.test(releaseDetails.releaseRootSha256)) {
-    throw new HttpError(503, 'dataset_readiness_invalid', 'readiness_details.releaseRootSha256 must be a lowercase SHA-256 digest');
+  if (
+    ready.manifest_source_snapshot_ready !== true
+    || ready.manifest_eval_v0_1_ready !== true
+    || ready.manifest_blocking_gap_count !== 0
+    || ready.manifest_readiness_status !== 'eval_v0_1_ready'
+  ) {
+    throw new HttpError(503, 'dataset_manifest_invalid', 'The active snapshot manifest is not ready', {
+      sourceSnapshotReady: ready.manifest_source_snapshot_ready,
+      evalV01Ready: ready.manifest_eval_v0_1_ready,
+      blockingGapCount: ready.manifest_blocking_gap_count,
+      readinessStatus: ready.manifest_readiness_status,
+    });
   }
+
+  const manifestFields = {
+    schemaVersion: 'manifest_schema_version',
+    catalogVersion: 'manifest_catalog_version',
+    indexVersion: 'manifest_index_version',
+    apiVersion: 'manifest_api_version',
+  };
+  const releaseIdentityDetails = Object.fromEntries(RELEASE_VERSION_FIELDS.map((key) => [
+    key,
+    requireNonEmptyString(ready[manifestFields[key]], `snapshot_manifest.${key}`, 'dataset_manifest_invalid'),
+  ]));
+  for (const key of RELEASE_VERSION_FIELDS) {
+    if (details[key] === undefined) continue;
+    const legacyValue = requireNonEmptyString(details[key], `readiness_details.${key}`);
+    if (legacyValue !== releaseIdentityDetails[key]) {
+      throw new HttpError(503, 'release_identity_inconsistent', `readiness_details.${key} does not match snapshot_manifest.${key}`, {
+        expected: releaseIdentityDetails[key],
+        actual: legacyValue,
+      });
+    }
+  }
+
+  const datasetProfile = requireNonEmptyString(details.datasetProfile, 'readiness_details.datasetProfile');
+  if (datasetProfile !== DATASET_PROFILE) {
+    throw new HttpError(503, 'dataset_readiness_invalid', 'readiness_details.datasetProfile does not match the supported dataset profile', {
+      expected: DATASET_PROFILE,
+      actual: datasetProfile,
+    });
+  }
+  const artifactHashes = {
+    sourceArtifactSha256: requireSha256(ready.manifest_source_artifact_sha256, 'snapshot_manifest.source_artifact_sha256'),
+    llmArtifactSha256: requireSha256(ready.manifest_llm_artifact_sha256, 'snapshot_manifest.llm_artifact_sha256'),
+  };
+  const releaseRootSha256 = details.releaseRootSha256 === undefined
+    ? undefined
+    : requireSha256(details.releaseRootSha256, 'readiness_details.releaseRootSha256', 'dataset_readiness_invalid');
   const counts = Object.fromEntries(RELEASE_COUNT_FIELDS.map((key) => [key, requireReadinessCount(details, key)]));
   if (counts.variantCount !== counts.offerCount || counts.variantCount !== counts.searchDocumentCount) {
     throw new HttpError(503, 'dataset_readiness_invalid', 'Variant, Offer, and search document counts must be identical', counts);
@@ -1308,7 +1392,7 @@ function parseActiveRelease(ready) {
     throw new HttpError(503, 'dataset_readiness_invalid', 'readiness counts violate Product/Variant cardinality invariants', counts);
   }
   if (details.stableEvalPublicationSwitched !== true) {
-    throw new HttpError(503, 'dataset_not_published', 'The v15 release is built but the stable eval publication has not been activated');
+    throw new HttpError(503, 'dataset_not_published', 'The active release is built but the stable eval publication has not been activated');
   }
   const checkedAt = new Date(ready.checked_at);
   if (Number.isNaN(checkedAt.getTime())) {
@@ -1316,7 +1400,10 @@ function parseActiveRelease(ready) {
   }
   return {
     snapshotId,
-    ...releaseDetails,
+    ...releaseIdentityDetails,
+    datasetProfile,
+    ...artifactHashes,
+    ...(releaseRootSha256 === undefined ? {} : { releaseRootSha256 }),
     ...counts,
     checkedAt: checkedAt.toISOString(),
   };
@@ -1340,7 +1427,7 @@ function assertRowReleaseIdentity(version, release) {
   const expected = releaseIdentity(release);
   for (const key of ['schemaVersion', 'catalogVersion', 'indexVersion', 'apiVersion', 'snapshotId']) {
     if (version?.[key] !== expected[key]) {
-      throw new HttpError(503, 'release_identity_inconsistent', `Database row ${key} does not match eval.dataset_readiness`, {
+      throw new HttpError(503, 'release_identity_inconsistent', `Database row ${key} does not match the active snapshot manifest`, {
         expected: expected[key],
         actual: version?.[key],
       });
@@ -1954,6 +2041,7 @@ export {
   matchedAttribute,
   parseActiveRelease,
   parseCursor,
+  readiness,
   rejectUnknownFields,
   requestFingerprint,
   requireEntryId,
