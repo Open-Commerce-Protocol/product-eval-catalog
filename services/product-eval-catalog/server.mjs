@@ -10,7 +10,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://data.deeplumen.io').replace(/\/+$/, '');
 const CATALOG_ID = 'cat_product_eval_100k_v01';
 const PROVIDER_ID = 'deeplumen_product_eval';
-const SERVICE_VERSION = 'product-eval-catalog-api.v0.4.1';
+const SERVICE_VERSION = 'product-eval-catalog-api.v0.5.0';
 const DATASET_PROFILE = 'source_products_synthetic_variants';
 const EXPECTED_DB_USER = process.env.EXPECTED_DB_USER || 'eval_reader';
 const DB_SSL_MODE = process.env.DB_SSL_MODE || 'require';
@@ -66,6 +66,8 @@ const OCP_QUERY_INPUT_FIELDS = Object.freeze([
   { name: 'sort_by', type: 'string', operators: ['eq'], description: 'Optional stable sort. Allowed values: relevance, price_asc, price_desc. Default: relevance.' },
   { name: 'cursor', type: 'string', operators: ['eq'], description: 'Opaque cursor from page.next_cursor. Maximum length: 512 bytes. It is bound to the active release and the exact query, filters, page size, and sort.' },
   { name: 'filters.category', type: 'string', operators: ['eq'], description: 'Exact categoryCode or category name.' },
+  { name: 'filters.product_type', type: 'string', operators: ['eq'], description: 'Exact second-level productTypeCode.' },
+  { name: 'filters.attributes', type: 'array', operators: ['match'], description: 'Structured product, variant, or option attribute filters.' },
   { name: 'filters.brand', type: 'string', operators: ['contains'], description: 'Case-insensitive brand code or brand name match.' },
   { name: 'filters.currency', type: 'string', operators: ['eq'], description: 'Allowed value for this release: CNY.' },
   { name: 'filters.availability_status', type: 'string', operators: ['eq'], description: 'Exact inventoryStatus, for example in_stock.' },
@@ -118,6 +120,8 @@ if (IS_MAIN_MODULE) {
 
 const STANDARD_FILTERS = new Set([
   'category',
+  'product_type',
+  'attributes',
   'brand',
   'currency',
   'availability_status',
@@ -167,6 +171,7 @@ const PUBLIC_VARIANT_FIELDS = Object.freeze([
   'variantTitleEn',
   'optionValues',
   'variantAttributes',
+  'variantStructure',
   'isActive',
 ]);
 const PUBLIC_OFFER_FIELDS = Object.freeze([
@@ -584,8 +589,9 @@ function addCommonFilters(where, params, filters) {
     where.push(`(sd."categoryCode" = ${ph} or sd."categoryNameZh" = ${ph} or sd."categoryNameEn" = ${ph})`);
   }
 
-  if (filters.productTypeCode !== undefined) {
-    where.push(`p."productTypeCode" = ${addParam(params, requireString(filters.productTypeCode, 'productTypeCode'))}`);
+  const productType = filters.product_type ?? filters.productTypeCode;
+  if (productType !== undefined) {
+    where.push(`p."productTypeCode" = ${addParam(params, requireString(productType, 'product_type'))}`);
   }
 
   if (filters.brand !== undefined) {
@@ -775,7 +781,7 @@ function buildSearchSql({ query, filters, attributeFilters, cursor, limit, sortB
       jsonb_build_object(
         'variantId', v."variantId", 'productId', v."productId", 'sku', v.sku,
         'variantTitleZh', v."variantTitleZh", 'variantTitleEn', v."variantTitleEn",
-        'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes",
+        'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes", 'variantStructure', v."variantStructure",
         'isActive', v."isActive"
       ) as variant,
       jsonb_build_object(
@@ -927,10 +933,7 @@ async function searchProducts(input, mode) {
   }
   const query = parseQuery(input.query ?? input.q);
   const filters = validateFilters(input.filters, isOcp ? STANDARD_FILTERS : API_FILTERS);
-  if (isOcp && input.attributeFilters !== undefined) {
-    throw new HttpError(400, 'unsupported_field', 'OCP CatalogQueryRequest does not support attributeFilters; use /api/search or /mcp');
-  }
-  const attributeFilters = isOcp ? [] : validateAttributeFilters(input.attributeFilters);
+  const attributeFilters = validateAttributeFilters(isOcp ? filters.attributes : (input.attributeFilters ?? filters.attributes));
   const limit = parseLimit(input.limit);
   const sortBy = validateSortBy(isOcp ? input.sort_by : input.sortBy);
   const queryPack = isOcp ? validateQueryPack(input.query_pack, { required: true }) : 'product-eval.api.search.v1';
@@ -983,7 +986,7 @@ async function fetchProductRow(productId) {
       jsonb_build_object(
         'variantId', v."variantId", 'productId', v."productId", 'sku', v.sku,
         'variantTitleZh', v."variantTitleZh", 'variantTitleEn', v."variantTitleEn",
-        'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes",
+        'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes", 'variantStructure', v."variantStructure",
         'isActive', v."isActive"
       ) as variant,
       jsonb_build_object(
@@ -1240,7 +1243,7 @@ async function listProductVariants(productId) {
     select jsonb_build_object(
       'variantId', v."variantId", 'productId', v."productId", 'sku', v.sku,
       'variantTitleZh', v."variantTitleZh", 'variantTitleEn', v."variantTitleEn",
-      'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes",
+      'optionValues', v."optionValues", 'variantAttributes', v."variantAttributes", 'variantStructure', v."variantStructure",
       'isActive', v."isActive",
       'schemaVersion', v."schemaVersion", 'catalogVersion', v."catalogVersion", 'snapshotId', v.snapshot_id,
       'offer', jsonb_build_object(
@@ -1464,7 +1467,7 @@ function manifestObjectContracts() {
       required_fields: [
         'variant#/variantId', 'variant#/productId', 'variant#/sku',
         'variant#/variantTitleZh', 'variant#/variantTitleEn', 'variant#/optionValues',
-        'variant#/variantAttributes', 'variant#/isActive',
+        'variant#/variantAttributes', 'variant#/variantStructure', 'variant#/isActive',
       ],
       additional_fields_policy: 'reject',
       identity_policy: {
@@ -1548,6 +1551,8 @@ function buildManifest(release) {
       ],
       filterable_field_refs: [
         'query#/filters/category',
+        'query#/filters/product_type',
+        'query#/filters/attributes',
         'query#/filters/brand',
         'query#/filters/currency',
         'query#/filters/availability_status',
@@ -1575,6 +1580,7 @@ function buildManifest(release) {
           allowed_request_fields: [...OCP_QUERY_BODY_FIELDS].sort(),
         },
         structured_attribute_filters: {
+          ocp_field: 'filters.attributes',
           api_url: `${PUBLIC_BASE_URL}/api/search`,
           mcp_url: `${PUBLIC_BASE_URL}/mcp`,
           fields: ['scope', 'attributeCode', 'valueCode', 'valueText', 'minNumericValue', 'maxNumericValue'],
@@ -1582,8 +1588,8 @@ function buildManifest(release) {
           examples: [
             { scope: 'option', attributeCode: 'color', valueCode: 'black' },
             { scope: 'option', attributeCode: 'size', valueText: '42' },
-            { scope: 'option', attributeCode: 'capacity', minNumericValue: 10000 },
-            { scope: 'option', attributeCode: 'configuration', valueCode: 'fast_charge' },
+            { scope: 'product', attributeCode: 'storage_capacity', minNumericValue: 10000 },
+            { scope: 'option', attributeCode: 'compatible_model', valueText: 'iPhone 15' },
           ],
         },
       },
@@ -1695,7 +1701,7 @@ function mcpTools() {
               required: ['scope', 'attributeCode'],
               properties: {
                 scope: { type: 'string', enum: ['product', 'variant', 'option', 'any'] },
-                attributeCode: { type: 'string', enum: ['color', 'size', 'capacity', 'configuration'] },
+                attributeCode: { type: 'string', minLength: 1 },
                 valueCode: { type: 'string', minLength: 1 },
                 valueText: { type: 'string', minLength: 1 },
                 minNumericValue: { type: 'number' },
@@ -1880,7 +1886,7 @@ The service rejects malformed requests instead of silently coercing them:
 
 ## Structured attribute search API
 
-OCP CLI currently accepts only fixed standard filter keys. For dynamic attributes such as color, size, capacity, and configuration, use API/MCP:
+OCP queries use \`filters.product_type\` for second-level taxonomy and \`filters.attributes\` for structured attributes. API/MCP also expose the same attribute matcher as \`attributeFilters\`:
 
 \`\`\`bash
 curl -sS ${PUBLIC_BASE_URL}/api/search \\

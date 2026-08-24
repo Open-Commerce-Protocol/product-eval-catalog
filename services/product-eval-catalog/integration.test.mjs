@@ -128,6 +128,7 @@ async function seedDatabase(pool) {
       "variantTitleEn" text not null,
       "optionValues" jsonb not null,
       "variantAttributes" jsonb not null,
+      "variantStructure" text not null,
       "isActive" boolean not null,
       "classificationStatus" text not null,
       "schemaVersion" text not null,
@@ -189,10 +190,10 @@ async function seedDatabase(pool) {
     insert into eval.product_variants values
       ('var_bag_black', 'prd_bag_1', 'BAG-BLACK', '黑色', 'Black',
        '[{"attributeCode":"color","attributeNameZh":"颜色","attributeNameEn":"Color","valueCode":"black","valueZh":"黑色","valueEn":"Black"}]',
-       '[]', true, 'classified', 'product-eval-schema.v2', 'catalog-v20260822-variant-enriched-01', '${SNAPSHOT_ID}'),
+       '[]', 'single_dimension', true, 'classified', 'product-eval-schema.v2', 'catalog-v20260822-variant-enriched-01', '${SNAPSHOT_ID}'),
       ('var_bag_red', 'prd_bag_1', 'BAG-RED', '红色', 'Red',
        '[{"attributeCode":"color","attributeNameZh":"颜色","attributeNameEn":"Color","valueCode":"red","valueZh":"红色","valueEn":"Red"}]',
-       '[]', true, 'classified', 'product-eval-schema.v2', 'catalog-v20260822-variant-enriched-01', '${SNAPSHOT_ID}');
+       '[]', 'single_dimension', true, 'classified', 'product-eval-schema.v2', 'catalog-v20260822-variant-enriched-01', '${SNAPSHOT_ID}');
     insert into eval.offers values
       ('off_bag_black', 'var_bag_black', 199.00, 'CNY', 229.00, 'in_stock', 8, true, '2026-08-22T15:30:41Z', '${SNAPSHOT_ID}'),
       ('off_bag_red', 'var_bag_red', 209.00, 'CNY', 239.00, 'in_stock', 6, true, '2026-08-22T15:30:41Z', '${SNAPSHOT_ID}');
@@ -261,6 +262,7 @@ test('serves health, manifest, search, resolve, variants, and MCP from manifest-
     });
     assert.equal(apiSearch.items.length, 1);
     assert.equal(apiSearch.items[0].variant.variantId, 'var_bag_black');
+    assert.equal(apiSearch.items[0].variant.variantStructure, 'single_dimension');
 
     const ocpQuery = await jsonRequest(baseUrl, '/ocp/query', {
       query_pack: 'ocp.query.product-eval.v1',
@@ -269,6 +271,18 @@ test('serves health, manifest, search, resolve, variants, and MCP from manifest-
       limit: 1,
     });
     assert.equal(ocpQuery.entries.length, 1);
+
+    const ocpFiltered = await jsonRequest(baseUrl, '/ocp/query', {
+      query_pack: 'ocp.query.product-eval.v1',
+      query_mode: 'filter',
+      filters: {
+        product_type: 'handbag',
+        attributes: [{ scope: 'option', attributeCode: 'color', valueCode: 'black' }],
+      },
+      limit: 3,
+    });
+    assert.equal(ocpFiltered.entries.length, 1);
+    assert.equal(ocpFiltered.entries[0].attributes.variant.variantId, 'var_bag_black');
 
     const resolved = await jsonRequest(baseUrl, '/api/resolve', { productId: 'prd_bag_1' });
     assert.equal(resolved.product.productId, 'prd_bag_1');

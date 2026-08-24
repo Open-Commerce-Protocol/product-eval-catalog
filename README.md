@@ -90,8 +90,11 @@ curl https://data.deeplumen.io/ocp/query \
   -H 'content-type: application/json' \
   --data '{
     "query_pack":"ocp.query.product-eval.v1",
-    "query_mode":"keyword",
-    "query":"bag",
+    "query_mode":"filter",
+    "filters": {
+      "product_type":"backpacks",
+      "attributes":[{"scope":"product","attributeCode":"waterproof","valueCode":"true"}]
+    },
     "limit":2
   }'
 ```
